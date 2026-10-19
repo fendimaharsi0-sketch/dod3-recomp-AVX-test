@@ -64,6 +64,20 @@
 #      SDL2_DIR di log Configure. Pastikan paste ter-commit + dispatch run
 #      BARU (Re-run run lama memakai file dari commit lama, edit yang belum
 #      di-commit juga tidak kepakai).
+#   7. v4 (v3 jalan tapi tetap gagal, 2026-10-19): log Configure run v3
+#      MEMBUKTIKAN v3 yang jalan (baris echo VCPKG_ROOT / CMAKE_PREFIX_PATH
+#      / SDL2_DIR ada) + verifikasi vcpkg lolos (job sampai Configure) +
+#      VCPKG_ROOT = vcpkg bawaan VS 18 (C:\Program Files\Microsoft Visual
+#      Studio\18\Enterprise\VC\vcpkg, bukan C:\vcpkg) — tapi find_package
+#      tetap NOT FOUND. Jadi bukan file hilang / path salah, tapi pencarian
+#      find_package-nya sendiri: ps3recomp memanggil find_package(SDL2
+#      QUIET) tanpa CONFIG, jadi CMake mencoba Module mode (FindSDL2.cmake)
+#      dulu, dan kalau Module mode gagal, Config mode tidak dicoba — SDL2_DIR
+#      + CMAKE_PREFIX_PATH (petunjuk Config) jadi tidak kepakai. v4:
+#      -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON (paksa Config mode dulu) +
+#      --debug-find-pkg=SDL2 (log pencarian; kalau masih gagal, log-nya yang
+#      kasih jawaban) + step debug list file SDL2 (continue-on-error:
+#      diagnostik tidak boleh menggagalkan build).
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -132,7 +146,7 @@ jobs:
       - name: Workflow version marker
         shell: pwsh
         run: |
-          Write-Host "WORKFLOW build-avx-cloud v3 (CMAKE_PREFIX_PATH + SDL2_DIR + vcpkg verify + LASTEXITCODE)"
+          Write-Host "WORKFLOW build-avx-cloud v4 (PREFER_CONFIG + debug-find-pkg + SDL2_DIR + CMAKE_PREFIX_PATH + vcpkg verify)"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -258,6 +272,22 @@ jobs:
         with:
           arch: x64
 
+      - name: Debug - list SDL2 files in vcpkg prefix
+        shell: pwsh
+        # Diagnostik murni: membuktikan file SDL2 ada di prefix PADA SAAT
+        # Configure. continue-on-error agar diagnostik tidak pernah
+        # menggagalkan build.
+        continue-on-error: true
+        run: |
+          $prefix = "$env:VCPKG_ROOT\installed\x64-windows"
+          Write-Host "Prefix: $prefix"
+          Write-Host "--- share/sdl2 ---"
+          Get-ChildItem "$prefix\share\sdl2" | Select-Object Name, Length
+          Write-Host "--- include/SDL2 (first 8) ---"
+          Get-ChildItem "$prefix\include\SDL2" | Select-Object -First 8 Name
+          Write-Host "--- lib/SDL2* ---"
+          Get-ChildItem "$prefix\lib" -Filter "SDL2*" | Select-Object Name, Length
+
       - name: Configure + Build (AVX)
         shell: pwsh
         env:
@@ -278,12 +308,13 @@ jobs:
           Write-Host "CMAKE_PREFIX_PATH=$vcpkgPrefix"
           Write-Host "SDL2_DIR=$sdl2Dir"
 
-          cmake -S . -B build-avx -G Ninja `
+          cmake --debug-find-pkg=SDL2 -S . -B build-avx -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DCMAKE_PREFIX_PATH="$vcpkgPrefix" `
             -DSDL2_DIR="$sdl2Dir" `
+            -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DDOD3_EBOOT=101 `
             -DRECOMP_DIR="$recomp" `
