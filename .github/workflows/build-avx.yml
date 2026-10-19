@@ -47,6 +47,14 @@
 #   4. Verify ditambah cek CMakeCache DOD3_X86_LEVEL == input (bukan cuma
 #      cek string gate). Kalau cache-nya ternyata v3, ketahuan di sini,
 #      bukan pas sudah jalan di i7-2600.
+#   5. SDL2 not found di Configure (run pertama, 2026-10-19): find_package
+#      (SDL2 QUIET) di ps3recomp/CMakeLists.txt:153 tidak menemukan SDL2
+#      walau step vcpkg lolos. Dua kemungkinan (log step vcpkg tidak ikut
+#      di screenshot): vcpkg install gagal diam-diam (PowerShell tidak
+#      menggagalkan step atas exit code native command) ATAU prefix vcpkg
+#      tidak terekspos ke CMake. Fix: cek $LASTEXITCODE + verifikasi
+#      SDL.h/SDL2Config.cmake di step vcpkg, dan -DCMAKE_PREFIX_PATH
+#      eksplisit di Configure (obat yang disarankan pesan error-nya).
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -138,8 +146,31 @@ jobs:
           if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
           Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgRoot" -Encoding utf8
 
-          Write-Host "Menginstall zlib dan sdl2 lewat vcpkg..."
+          Write-Host "Menginstall zlib dan sdl2 lewat vcpkg (vcpkg root: $vcpkgRoot)..."
           & "$vcpkgRoot\vcpkg.exe" install zlib:x64-windows sdl2:x64-windows
+          # PowerShell TIDAK menggagalkan step kalau native command (vcpkg.exe)
+          # exit non-zero — harus dicek manual, kalau tidak kegagalan install
+          # diam-diam lolos dan baru ketahuan di Configure sebagai
+          # "SDL2 not found".
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "vcpkg install gagal (exit code $LASTEXITCODE). Lihat log di atas."
+            exit $LASTEXITCODE
+          }
+
+          # Verifikasi keras: file yang dicari CMake harus benar-benar ada di
+          # prefix vcpkg. Kalau tidak ada, gagal DI SINI dengan pesan jelas,
+          # bukan di Configure.
+          $sdl2Header = "$vcpkgRoot\installed\x64-windows\include\SDL2\SDL.h"
+          $sdl2Config = "$vcpkgRoot\installed\x64-windows\share\sdl2\SDL2Config.cmake"
+          if (-not (Test-Path $sdl2Header)) {
+            Write-Error "SDL2 header tidak ditemukan di $sdl2Header — vcpkg install tidak menghasilkan SDL2 di prefix ini."
+            exit 1
+          }
+          if (-not (Test-Path $sdl2Config)) {
+            Write-Error "SDL2Config.cmake tidak ditemukan di $sdl2Config."
+            exit 1
+          }
+          Write-Host "SDL2 terverifikasi di $vcpkgRoot\installed\x64-windows"
 
       - name: Download & Validate EBOOT_101.ELF
         shell: pwsh
@@ -222,11 +253,18 @@ jobs:
         run: |
           $recomp = ($PWD.Path + '/recompiled_101').Replace('\', '/')
           $toolchain = ($env:VCPKG_ROOT + '/scripts/buildsystems/vcpkg.cmake').Replace('\', '/')
+          # Prefix eksplisit: ini obat yang disarankan pesan error-nya
+          # sendiri ("pass -DCMAKE_PREFIX_PATH=<prefix>"). Tanpa ini CMake
+          # hanya mengandalkan toolchain untuk mengekspos prefix vcpkg;
+          # dengan ini find_package(SDL2) melihat installed dir secara
+          # langsung, apa pun yang terjadi di toolchain.
+          $vcpkgPrefix = ($env:VCPKG_ROOT + '/installed/x64-windows').Replace('\', '/')
 
           cmake -S . -B build-avx -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
+            -DCMAKE_PREFIX_PATH="$vcpkgPrefix" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DDOD3_EBOOT=101 `
             -DRECOMP_DIR="$recomp" `
