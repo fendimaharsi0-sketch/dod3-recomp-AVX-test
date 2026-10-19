@@ -55,6 +55,15 @@
 #      tidak terekspos ke CMake. Fix: cek $LASTEXITCODE + verifikasi
 #      SDL.h/SDL2Config.cmake di step vcpkg, dan -DCMAKE_PREFIX_PATH
 #      eksplisit di Configure (obat yang disarankan pesan error-nya).
+#   6. v3 (run kedua masih gagal error identik, 2026-10-19): run kedua
+#      (ID beda) gagal sama persis, jadi perlu bukti file mana yang jalan.
+#      v3 tambah (a) step "Workflow version marker" yang nge-print versi
+#      workflow di log — kalau step itu tidak ada di suatu run, berarti run
+#      itu pakai file lama; (b) -DSDL2_DIR=<prefix>/share/sdl2 untuk memaksa
+#      lookup Config-mode; (c) echo VCPKG_ROOT / CMAKE_PREFIX_PATH /
+#      SDL2_DIR di log Configure. Pastikan paste ter-commit + dispatch run
+#      BARU (Re-run run lama memakai file dari commit lama, edit yang belum
+#      di-commit juga tidak kepakai).
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -119,6 +128,11 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
+
+      - name: Workflow version marker
+        shell: pwsh
+        run: |
+          Write-Host "WORKFLOW build-avx-cloud v3 (CMAKE_PREFIX_PATH + SDL2_DIR + vcpkg verify + LASTEXITCODE)"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -259,12 +273,17 @@ jobs:
           # dengan ini find_package(SDL2) melihat installed dir secara
           # langsung, apa pun yang terjadi di toolchain.
           $vcpkgPrefix = ($env:VCPKG_ROOT + '/installed/x64-windows').Replace('\', '/')
+          $sdl2Dir = "$vcpkgPrefix/share/sdl2"
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+          Write-Host "CMAKE_PREFIX_PATH=$vcpkgPrefix"
+          Write-Host "SDL2_DIR=$sdl2Dir"
 
           cmake -S . -B build-avx -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DCMAKE_PREFIX_PATH="$vcpkgPrefix" `
+            -DSDL2_DIR="$sdl2Dir" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DDOD3_EBOOT=101 `
             -DRECOMP_DIR="$recomp" `
