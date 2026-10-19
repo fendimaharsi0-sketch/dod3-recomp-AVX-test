@@ -78,6 +78,20 @@
 #      --debug-find-pkg=SDL2 (log pencarian; kalau masih gagal, log-nya yang
 #      kasih jawaban) + step debug list file SDL2 (continue-on-error:
 #      diagnostik tidak boleh menggagalkan build).
+#   8. v5 (v4 ketemu akar sebenarnya, 2026-10-19): file TER-COMMIT di repo
+#      sudah v4 penuh (verifikasi vcpkg ada — dicek langsung dari GitHub),
+#      dan run v4-nya menunjukkan PARADOKS: step vcpkg lolos verifikasi
+#      (Test-Path menemukan SDL2Config.cmake) TAPI step debug beberapa
+#      menit kemudian bilang share/sdl2 TIDAK ADA di prefix yang sama.
+#      Jadi file SDL2 ada saat step vcpkg, hilang saat Configure — prefix
+#      vcpkg bawaan VS 18 (VC\vcpkg\installed) tidak bisa dipercaya
+#      untuk bertahan antar-step (VS mengelolanya sebagai cache).
+#      v5: JANGAN PAKAI vcpkg bawaan VS. Clone vcpkg sendiri ke
+#      C:\vcpkg-dod3 (di luar jangkauan VS), bootstrap, install, verifikasi
+#      — semua pakai clone itu. MSVC step dipindah ke awal (sebelum vcpkg)
+#      agar bootstrap + vcpkg menemukan compiler VS. Configure tambah
+#      verifikasi SDL2Config.cmake tepat sebelum cmake (fail-fast kalau
+#      prefix-nya kosong).
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -146,7 +160,12 @@ jobs:
       - name: Workflow version marker
         shell: pwsh
         run: |
-          Write-Host "WORKFLOW build-avx-cloud v4 (PREFER_CONFIG + debug-find-pkg + SDL2_DIR + CMAKE_PREFIX_PATH + vcpkg verify)"
+          Write-Host "WORKFLOW build-avx-cloud v5 (dedicated vcpkg clone + PREFER_CONFIG + debug-find-pkg + SDL2_DIR + vcpkg verify)"
+
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -167,14 +186,35 @@ jobs:
             }
           }
 
-      - name: Install vcpkg Dependencies
+      - name: Install vcpkg (dedicated clone) + Dependencies
         shell: pwsh
         run: |
-          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          # v5: JANGAN pakai vcpkg bawaan VS 18 (VCPKG_INSTALLATION_ROOT =
+          # VC\vcpkg). Run v4 membuktikan file SDL2 yang ter-install di sana
+          # hilang sebelum Configure (verifikasi vcpkg lolos, tapi step debug
+          # bilang share/sdl2 tidak ada) — VS mengelola installed-nya sebagai
+          # cache. Clone vcpkg sendiri ke C:\vcpkg-dod3 (di luar jangkauan
+          # VS) dan pakai clone itu untuk semuanya.
+          $vcpkgRoot = "C:\vcpkg-dod3"
           Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgRoot" -Encoding utf8
 
-          Write-Host "Menginstall zlib dan sdl2 lewat vcpkg (vcpkg root: $vcpkgRoot)..."
+          if (-not (Test-Path "$vcpkgRoot\vcpkg.exe")) {
+            if (Test-Path $vcpkgRoot) { Remove-Item -Recurse -Force $vcpkgRoot }
+            Write-Host "Cloning vcpkg ke $vcpkgRoot..."
+            git clone --depth 1 https://github.com/microsoft/vcpkg $vcpkgRoot
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "git clone vcpkg gagal (exit code $LASTEXITCODE)."
+              exit $LASTEXITCODE
+            }
+            Write-Host "Bootstrap vcpkg..."
+            & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "bootstrap-vcpkg gagal (exit code $LASTEXITCODE)."
+              exit $LASTEXITCODE
+            }
+          }
+
+          Write-Host "Menginstall zlib dan sdl2 lewat vcpkg clone (root: $vcpkgRoot)..."
           & "$vcpkgRoot\vcpkg.exe" install zlib:x64-windows sdl2:x64-windows
           # PowerShell TIDAK menggagalkan step kalau native command (vcpkg.exe)
           # exit non-zero — harus dicek manual, kalau tidak kegagalan install
@@ -186,7 +226,7 @@ jobs:
           }
 
           # Verifikasi keras: file yang dicari CMake harus benar-benar ada di
-          # prefix vcpkg. Kalau tidak ada, gagal DI SINI dengan pesan jelas,
+          # prefix clone. Kalau tidak ada, gagal DI SINI dengan pesan jelas,
           # bukan di Configure.
           $sdl2Header = "$vcpkgRoot\installed\x64-windows\include\SDL2\SDL.h"
           $sdl2Config = "$vcpkgRoot\installed\x64-windows\share\sdl2\SDL2Config.cmake"
@@ -267,11 +307,6 @@ jobs:
         run: |
           bash tools/lift_spu.sh
 
-      - name: MSVC dev environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
       - name: Debug - list SDL2 files in vcpkg prefix
         shell: pwsh
         # Diagnostik murni: membuktikan file SDL2 ada di prefix PADA SAAT
@@ -307,6 +342,15 @@ jobs:
           Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
           Write-Host "CMAKE_PREFIX_PATH=$vcpkgPrefix"
           Write-Host "SDL2_DIR=$sdl2Dir"
+
+          # Fail-fast di titik pakai: SDL2Config harus ada di prefix SAAT INI
+          # (run v4: ada saat step vcpkg, hilang saat Configure). Kalau
+          # hilang, gagal di sini dengan pesan jelas, bukan lewat error
+          # find_package yang membingungkan.
+          if (-not (Test-Path "$env:VCPKG_ROOT\installed\x64-windows\share\sdl2\SDL2Config.cmake")) {
+            Write-Error "SDL2Config.cmake HILANG dari prefix $env:VCPKG_ROOT\installed\x64-windows saat Configure. Prefix vcpkg tidak bertahan antar-step."
+            exit 1
+          }
 
           cmake --debug-find-pkg=SDL2 -S . -B build-avx -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
