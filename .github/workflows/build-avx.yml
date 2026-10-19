@@ -92,6 +92,18 @@
 #      agar bootstrap + vcpkg menemukan compiler VS. Configure tambah
 #      verifikasi SDL2Config.cmake tepat sebelum cmake (fail-fast kalau
 #      prefix-nya kosong).
+#   9. v6 (v5: BUILD SUKSES, Verify yang gagal — 2026-10-19): run v5
+#      (39195108210, 27m2s) membuktikan clone vcpkg bekerja: Configure
+#      menemukan SDL2, Build jalan 20m10s dan lolos, CMakeCache level
+#      = x86-64-v2, string gate AVX2 tidak ada. Yang gagal hanya step
+#      Verify Binary: ia print "Verifikasi lolos" lalu exit code 1.
+#      Penyebabnya: findstr exit 1 saat string TIDAK ditemukan (= hasil
+#      yang diinginkan), dan PowerShell mengembalikan $LASTEXITCODE sebagai
+#      exit code script — jadi kode 1 itu bocor dan menggagalkan step
+#      walau semua cek lolos. v6: tangkap hasil findstr ke variabel,
+#      reset $LASTEXITCODE = 0, dan akhiri step Verify dengan exit 0
+#      eksplisit. Satu-satunya native command di Verify adalah findstr,
+#      jadi ini menutup semua jalur bocor di step itu.
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -160,7 +172,7 @@ jobs:
       - name: Workflow version marker
         shell: pwsh
         run: |
-          Write-Host "WORKFLOW build-avx-cloud v5 (dedicated vcpkg clone + PREFER_CONFIG + debug-find-pkg + SDL2_DIR + vcpkg verify)"
+          Write-Host "WORKFLOW build-avx-cloud v6 (Verify LASTEXITCODE fix + dedicated vcpkg clone + PREFER_CONFIG + debug-find-pkg + SDL2_DIR)"
 
       - name: MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -392,12 +404,19 @@ jobs:
             exit 1
           }
 
+          # findstr exit 1 = string TIDAK ditemukan (= hasil yang
+          # diinginkan). Tapi PowerShell mengembalikan $LASTEXITCODE sebagai
+          # exit code script — tanpa reset, kode 1 itu bocor dan step ini
+          # gagal walau semua cek lolos (itulah yang mematikan run v5).
           findstr /M /C:"needs a CPU with AVX2" build-avx\dod3.exe | Out-Null
-          if ($LASTEXITCODE -eq 0) {
+          $gateFound = ($LASTEXITCODE -eq 0)
+          $LASTEXITCODE = 0
+          if ($gateFound) {
             Write-Error "Gate AVX2 masih terdeteksi di dalam exe!"
             exit 1
           }
           Write-Host "Verifikasi lolos: dod3.exe dibuat untuk AVX (tanpa AVX2 lock)."
+          exit 0
 
       - name: Package Release
         if: ${{ inputs.package }}
