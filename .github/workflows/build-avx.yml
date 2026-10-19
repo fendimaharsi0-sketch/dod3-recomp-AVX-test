@@ -1,0 +1,194 @@
+name: Build dod3 (AVX) - Cloud Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      eboot_url:
+        description: "Direct download URL ke EBOOT_101.ELF (misal: pre-signed link / cloud storage pribadi)"
+        required: true
+        type: string
+      x86_level:
+        description: "DOD3_X86_LEVEL: x86-64-v2 = AVX (Sandy Bridge / i7-2600). Kosongkan untuk baseline."
+        type: string
+        default: "x86-64-v2"
+      jobs:
+        description: "Parallel compile jobs (Ninja -j). Disarankan '1' atau '2' karena runner cloud gratis hanya memiliki RAM 7 GB."
+        type: string
+        default: "1"
+      symbols:
+        description: "DOD3_SYMBOLS. OFF = ukuran build jauh lebih kecil & memori lebih hemat."
+        type: boolean
+        default: false
+      package:
+        description: "Jalankan tools/package_win.sh ke dist/."
+        type: boolean
+        default: true
+      version:
+        description: "Label versi ZIP (dist/dod3-recomp-<version>-win64.zip)"
+        type: string
+        default: "0.2.5-avx"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dod3-avx-build
+  cancel-in-progress: false
+
+jobs:
+  build-avx:
+    name: Build dod3.exe (AVX, Cloud Hosted)
+    runs-on: windows-latest
+    timeout-minutes: 360 # Maksimal batas run GitHub Actions
+
+    env:
+      VCPKG_TARGET_TRIPLET: x64-windows
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup LLVM / clang-cl
+        shell: pwsh
+        run: |
+          # Periksa apakah clang-cl sudah ada di runner
+          if (-not (Get-Command clang-cl -ErrorAction SilentlyContinue)) {
+            if (Test-Path "C:\Program Files\LLVM\bin\clang-cl.exe") {
+              Write-Host "Menambahkan LLVM bawaan ke PATH..."
+              "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            } else {
+              Write-Host "Menginstall LLVM via Choco..."
+              choco install llvm -y --no-progress
+              "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+          }
+
+      - name: Install vcpkg Dependencies
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$vcpkgRoot" -Encoding utf8
+          
+          Write-Host "Menginstall zlib dan sdl2 lewat vcpkg..."
+          & "$vcpkgRoot\vcpkg.exe" install zlib:x64-windows sdl2:x64-windows
+
+      - name: Download & Validate EBOOT_101.ELF
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path elf | Out-Null
+          
+          Write-Host "Mengunduh EBOOT_101.ELF dari URL input..."
+          curl.exe -L -f -o elf/EBOOT_101.ELF "${{ inputs.eboot_url }}"
+          
+          if (-not (Test-Path elf/EBOOT_101.ELF)) {
+            Write-Error "Gagal mendownload EBOOT_101.ELF. Periksa URL input."
+            exit 1
+          }
+
+          $size = (Get-Item elf/EBOOT_101.ELF).Length
+          Write-Host "Ukuran file: $size bytes"
+          if ($size -ne 26872424) {
+            Write-Error "Ukuran file tidak cocok ($size bytes, seharusnya 26,872,424 bytes)."
+            exit 1
+          }
+
+          $sha = (Get-FileHash elf/EBOOT_101.ELF -Algorithm SHA256).Hash.ToLower()
+          Write-Host "SHA-256: $sha"
+          if (-not $sha.StartsWith('ed89e80f2336a948')) {
+            Write-Warning "Prefix SHA-256 tidak cocok dengan versi 1.01 resmi!"
+          }
+
+      - name: Install Python Requirements
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r ps3recomp/tools/requirements.txt -r tools/requirements.txt
+
+      - name: Lift PPU -> recompiled_101/
+        shell: bash
+        run: |
+          python ps3recomp/tools/ppu_loader.py elf/EBOOT_101.ELF -o out/v101/
+          python ps3recomp/tools/ppu_lifter.py elf/EBOOT_101.ELF \
+            --functions out/v101/EBOOT_101.functions.json \
+            --hle-stubs out/v101/EBOOT_101.imports.json \
+            --code-end 0x157fc00 \
+            --nonvolatile-locals \
+            --hook 0x000C1E50 --hook 0x00EE7728 --hook 0x00272E58 \
+            -o recompiled_101/
+
+      - name: Lift SPU -> spu/
+        shell: bash
+        run: |
+          bash tools/lift_spu.sh
+
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure + Build (AVX)
+        shell: pwsh
+        env:
+          DOD3_LEVEL: ${{ inputs.x86_level }}
+          DOD3_JOBS: ${{ inputs.jobs }}
+          DOD3_SYMBOLS_FLAG: ${{ inputs.symbols && 'ON' || 'OFF' }}
+        run: |
+          $recomp = ($PWD.Path + '/recompiled_101').Replace('\', '/')
+          $toolchain = ($env:VCPKG_ROOT + '/scripts/buildsystems/vcpkg.cmake').Replace('\', '/')
+          
+          cmake -S . -B build-avx -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DDOD3_EBOOT=101 `
+            -DRECOMP_DIR="$recomp" `
+            -DDOD3_X86_LEVEL="$env:DOD3_LEVEL" `
+            -DDOD3_SYMBOLS=$env:DOD3_SYMBOLS_FLAG
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          
+          # Gunakan -j sesuai input (default 1 untuk mencegah Out of Memory di RAM 7 GB)
+          cmake --build build-avx -- -j $env:DOD3_JOBS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Binary
+        shell: pwsh
+        env:
+          DOD3_LEVEL: ${{ inputs.x86_level }}
+        run: |
+          if (-not (Test-Path build-avx/dod3.exe)) {
+            Write-Error "build-avx/dod3.exe tidak ditemukan."
+            exit 1
+          }
+
+          findstr /M /C:"needs a CPU with AVX2" build-avx\dod3.exe | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Gate AVX2 masih terdeteksi di dalam exe!"
+            exit 1
+          }
+          Write-Host "Verifikasi lolos: dod3.exe dibuat tanpa instruksi mutlak AVX2."
+
+      - name: Package Release
+        if: ${{ inputs.package }}
+        shell: bash
+        run: |
+          bash tools/package_win.sh "${{ inputs.version }}" build-avx
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dod3-recomp-${{ inputs.version }}-win64
+          path: |
+            dist/*.zip
+            build-avx/dod3.exe
+          if-no-files-found: error
