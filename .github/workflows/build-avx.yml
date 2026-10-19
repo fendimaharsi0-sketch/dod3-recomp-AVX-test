@@ -121,6 +121,18 @@
 #      jalan (exe + DLL + ini). package_win.sh tetap jalan (continue-
 #      on-error) — kalau glob VC143-nya cocok, bonus zip dist ikut
 #      ke-upload; kalau tidak, artifact loose tetap lengkap.
+#  11. v8 (staging gagal: zlib1.dll tidak ada di bin vcpkg — 2026-10-19):
+#      run v7 (39222328545, 43m37s): Build lolos (31m40s), staging gagal
+#      karena C:\vcpkg-dod3\installed\x64-windows\bin\zlib1.dll tidak
+#      ada (padahal SDL2.dll ada di bin yang sama). Fendi mengonfirmasi
+#      exe-nya memang manggil DLL zlib (build awal juga manggil z.dll),
+#      jadi gagal keras di staging itu BENAR — masalahnya cuma nama file
+#      DLL zlib-nya bukan zlib1.dll (vcpkg bisa menghasilkan zlib.dll).
+#      v8: nama DLL zlib TIDAK di-hardcode — cari pola zlib*.dll di
+#      build-avx/ (hasil applocal vcpkg) dulu, lalu di bin vcpkg, copy
+#      apa pun yang ketemu; gagal keras kalau tidak ketemu di keduanya.
+#      Verify juga cek pola zlib*.dll, bukan nama zlib1.dll. Log run v8
+#      (baris "Staged zlib...") akan menunjukkan nama sebenarnya.
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -189,7 +201,7 @@ jobs:
       - name: Workflow version marker
         shell: pwsh
         run: |
-          Write-Host "WORKFLOW build-avx-cloud v7 (stage runtime DLLs + dedicated vcpkg clone + Verify LASTEXITCODE fix + PREFER_CONFIG)"
+          Write-Host "WORKFLOW build-avx-cloud v8 (zlib DLL discovery zlib*.dll + stage runtime DLLs + dedicated vcpkg clone + Verify LASTEXITCODE fix)"
 
       - name: MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -405,19 +417,37 @@ jobs:
           # v7: DLL runtime HARUS ikut artifact. Artifact run v6 hanya
           # berisi dod3.exe telanjang -> error "DLL not found" saat
           # dijalankan (SDL2, zlib, VC redist tidak ada di sebelah exe).
-          # Stage di sini (sebelum Verify): SDL2.dll + zlib1.dll dari bin
+          # Stage di sini (sebelum Verify): SDL2.dll + zlib DLL dari bin
           # vcpkg clone (lokasi deterministik), CRT DLL dari folder
           # Microsoft.VC*.CRT apa pun (package_win.sh hardcode VC143 — di
           # VS 18 foldernya bisa VC144/VC145), plus dod3.ini.
           $bin = "$env:VCPKG_ROOT\installed\x64-windows\bin"
-          foreach ($dll in @('SDL2.dll', 'zlib1.dll')) {
-            $src = Join-Path $bin $dll
-            if (-not (Test-Path $src)) {
-              Write-Error "Runtime DLL tidak ditemukan di $src — vcpkg install tidak menghasilkan $dll."
+          # SDL2.dll: nama pasti (terbukti ada di bin vcpkg di run v7).
+          $sdl2 = Join-Path $bin 'SDL2.dll'
+          if (-not (Test-Path $sdl2)) {
+            Write-Error "Runtime DLL tidak ditemukan di $sdl2 — vcpkg install tidak menghasilkan SDL2.dll."
+            exit 1
+          }
+          Copy-Item $sdl2 build-avx/ -Force
+          Write-Host "Staged SDL2.dll"
+
+          # zlib: nama DLL TIDAK di-hardcode. vcpkg bisa menghasilkan
+          # zlib1.dll atau zlib.dll (run v7: zlib1.dll tidak ada di bin
+          # padahal SDL2.dll ada). Cari pola zlib*.dll di build-avx/
+          # (hasil applocal vcpkg saat Build) dulu, lalu di bin vcpkg.
+          # Copy apa pun yang ketemu — nama import di exe selalu cocok
+          # dengan nama file DLL dari install vcpkg yang sama.
+          $zlibDll = Get-ChildItem "build-avx\zlib*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($zlibDll) {
+            Write-Host ("zlib DLL sudah ada di build-avx/: " + $zlibDll.Name)
+          } else {
+            $zlibDll = Get-ChildItem "$bin\zlib*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $zlibDll) {
+              Write-Error "DLL zlib tidak ditemukan di build-avx/ maupun di $bin (dicari zlib*.dll). vcpkg install tidak menghasilkan DLL zlib."
               exit 1
             }
-            Copy-Item $src build-avx/ -Force
-            Write-Host "Staged $dll"
+            Copy-Item $zlibDll.FullName build-avx/ -Force
+            Write-Host ("Staged " + $zlibDll.Name)
           }
 
           $crtDirs = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName
@@ -477,11 +507,14 @@ jobs:
           }
           # v7: DLL runtime wajib ada di sebelah exe, kalau tidak exe
           # tidak bisa jalan di PC pemain (itulah error run v6).
-          foreach ($dll in @('SDL2.dll', 'zlib1.dll')) {
-            if (-not (Test-Path "build-avx/$dll")) {
-              Write-Error "Runtime DLL $dll tidak ada di build-avx/ — exe tidak bisa jalan tanpa DLL ini."
-              exit 1
-            }
+          if (-not (Test-Path "build-avx/SDL2.dll")) {
+            Write-Error "Runtime DLL SDL2.dll tidak ada di build-avx/ — exe tidak bisa jalan tanpa DLL ini."
+            exit 1
+          }
+          # zlib: cek pola, bukan nama (bisa zlib1.dll atau zlib.dll).
+          if (-not (Get-ChildItem "build-avx\zlib*.dll" -ErrorAction SilentlyContinue)) {
+            Write-Error "DLL zlib (zlib*.dll) tidak ada di build-avx/ — exe tidak bisa jalan tanpa DLL ini."
+            exit 1
           }
           foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
             if (-not (Test-Path "build-avx/$dll")) {
