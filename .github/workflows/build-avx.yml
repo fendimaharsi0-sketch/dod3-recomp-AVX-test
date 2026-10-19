@@ -104,6 +104,23 @@
 #      reset $LASTEXITCODE = 0, dan akhiri step Verify dengan exit 0
 #      eksplisit. Satu-satunya native command di Verify adalah findstr,
 #      jadi ini menutup semua jalur bocor di step itu.
+#  10. v7 (exe jalan tapi error DLL runtime hilang — 2026-10-19): artifact
+#      run v6 hanya berisi dod3.exe telanjang -> saat dijalankan, Windows
+#      error karena SDL2.dll / zlib1.dll / VC redist tidak ada di sebelah
+#      exe. Penyebab ganda: (a) Upload hanya meng-upload dod3.exe (+
+#      dist/*.zip kalau ada); (b) package_win.sh kemungkinan gagal
+#      diam-diam (continue-on-error) karena glob-nya hardcode
+#      Microsoft.VC143.CRT — di VS 18 foldernya bisa VC144/VC145 — jadi
+#      tidak ada zip. v7: step baru "Stage runtime DLLs" (setelah Build,
+#      sebelum Verify) meng-copy SDL2.dll + zlib1.dll dari bin vcpkg +
+#      CRT DLL (msvcp140, vcruntime140, vcruntime140_1) dari folder
+#      Microsoft.VC*.CRT apa pun + dod3.ini ke build-avx/; Verify tambah
+#      cek DLL (SDL2/zlib wajib ada, CRT warning kalau hilang); Upload
+#      tambah build-avx/*.dll + build-avx/dod3.ini. Artifact GitHub
+#      di-download sebagai zip, jadi isinya langsung satu set yang bisa
+#      jalan (exe + DLL + ini). package_win.sh tetap jalan (continue-
+#      on-error) — kalau glob VC143-nya cocok, bonus zip dist ikut
+#      ke-upload; kalau tidak, artifact loose tetap lengkap.
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -172,7 +189,7 @@ jobs:
       - name: Workflow version marker
         shell: pwsh
         run: |
-          Write-Host "WORKFLOW build-avx-cloud v6 (Verify LASTEXITCODE fix + dedicated vcpkg clone + PREFER_CONFIG + debug-find-pkg + SDL2_DIR)"
+          Write-Host "WORKFLOW build-avx-cloud v7 (stage runtime DLLs + dedicated vcpkg clone + Verify LASTEXITCODE fix + PREFER_CONFIG)"
 
       - name: MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -382,6 +399,49 @@ jobs:
           cmake --build build-avx -- -j $env:DOD3_JOBS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Stage runtime DLLs into build-avx
+        shell: pwsh
+        run: |
+          # v7: DLL runtime HARUS ikut artifact. Artifact run v6 hanya
+          # berisi dod3.exe telanjang -> error "DLL not found" saat
+          # dijalankan (SDL2, zlib, VC redist tidak ada di sebelah exe).
+          # Stage di sini (sebelum Verify): SDL2.dll + zlib1.dll dari bin
+          # vcpkg clone (lokasi deterministik), CRT DLL dari folder
+          # Microsoft.VC*.CRT apa pun (package_win.sh hardcode VC143 — di
+          # VS 18 foldernya bisa VC144/VC145), plus dod3.ini.
+          $bin = "$env:VCPKG_ROOT\installed\x64-windows\bin"
+          foreach ($dll in @('SDL2.dll', 'zlib1.dll')) {
+            $src = Join-Path $bin $dll
+            if (-not (Test-Path $src)) {
+              Write-Error "Runtime DLL tidak ditemukan di $src — vcpkg install tidak menghasilkan $dll."
+              exit 1
+            }
+            Copy-Item $src build-avx/ -Force
+            Write-Host "Staged $dll"
+          }
+
+          $crtDirs = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName
+          if ($crtDirs) {
+            $crt = $crtDirs[-1].FullName
+            Write-Host "CRT folder: $crt"
+            foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+              $src = Join-Path $crt $dll
+              if (Test-Path $src) {
+                Copy-Item $src build-avx/ -Force
+                Write-Host "Staged $dll"
+              } else {
+                Write-Warning "CRT DLL $dll tidak ada di $crt."
+              }
+            }
+          } else {
+            Write-Warning "Folder Microsoft.VC*.CRT tidak ditemukan — CRT DLL tidak di-stage. PC tanpa VC Redist tidak bisa menjalankan exe."
+          }
+
+          if (Test-Path dod3.ini) {
+            Copy-Item dod3.ini build-avx/ -Force
+            Write-Host "Staged dod3.ini"
+          }
+
       - name: Verify Binary
         shell: pwsh
         env:
@@ -415,6 +475,19 @@ jobs:
             Write-Error "Gate AVX2 masih terdeteksi di dalam exe!"
             exit 1
           }
+          # v7: DLL runtime wajib ada di sebelah exe, kalau tidak exe
+          # tidak bisa jalan di PC pemain (itulah error run v6).
+          foreach ($dll in @('SDL2.dll', 'zlib1.dll')) {
+            if (-not (Test-Path "build-avx/$dll")) {
+              Write-Error "Runtime DLL $dll tidak ada di build-avx/ — exe tidak bisa jalan tanpa DLL ini."
+              exit 1
+            }
+          }
+          foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            if (-not (Test-Path "build-avx/$dll")) {
+              Write-Warning "CRT DLL $dll tidak ada di build-avx/ — PC tanpa VC Redist tidak bisa menjalankan exe."
+            }
+          }
           Write-Host "Verifikasi lolos: dod3.exe dibuat untuk AVX (tanpa AVX2 lock)."
           exit 0
 
@@ -434,4 +507,6 @@ jobs:
           path: |
             dist/*.zip
             build-avx/dod3.exe
+            build-avx/*.dll
+            build-avx/dod3.ini
           if-no-files-found: error
