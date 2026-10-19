@@ -2,7 +2,8 @@
 #
 # PERBEDAAN DARI VARIAN SELF-HOSTED (build-avx.yml):
 #   Varian ini jalan di windows-latest (runner ephemeral Microsoft) dan
-#   download EBOOT dari URL yang disimpan sebagai SECRET repo, lalu upload
+#   download EBOOT dari URL yang diisi di kolom input tiap run (default
+#   kosong, tidak tersimpan di file), lalu upload
 #   hasil build sebagai artifact GitHub. Itu pilihan sadar dengan trade-off:
 #
 #   - EBOOT (file game 26 MB) DI-DOWNLOAD ke disk VM runner Microsoft selama
@@ -14,18 +15,17 @@
 #   - Karena itu: pakai varian ini HANYA di FORK PRIVAT, jangan di repo
 #     publik. Jangan pernah taruh URL EBOOT di file ini (lihat bawah).
 #
-# EBOOT_URL = REPO SECRET, BUKAN INPUT, BUKAN DEFAULT
-#   Jangan taruh link Dropbox (atau link file game apa pun) sebagai default
-#   input di file workflow. Alasannya:
-#   - Workflow file yang ke-commit ikut ke repo: kalau repo-nya publik (atau
-#     jadi publik nanti), link-nya ikut publik — siapa pun bisa download
-#     EBOOT-nya dari Dropbox.
-#   - workflow_dispatch inputs BUKAN secret: nilainya tampil di log run dan
-#     di API, tidak di-mask.
-#   - Secrets GitHub DI-MASK di log. Jadi: Settings > Secrets and variables
-#     > Actions > New repository secret, nama EBOOT_URL, isi link download
-#     langsung (Dropbox: ...?dl=1). Workflow ini baca ${{ secrets.EBOOT_URL }}.
-#   - Kalau secret kosong, workflow gagal di awal dengan pesan yang jelas.
+# EBOOT_URL = INPUT TIAP RUN, DEFAULT KOSONG
+#   Kolom input eboot_url ada lagi, tapi default-nya KOSONG — tidak ada link
+#   apa pun yang tersimpan di file ini. Tiap kali Run workflow, isi kolom itu
+#   dengan link download langsung EBOOT_101.ELF (Dropbox: ...?dl=1).
+#   Kenapa default kosong: workflow file yang ke-commit ikut ke repo; kalau
+#   ada link di default-nya dan repo-nya publik (atau jadi publik nanti),
+#   link-nya ikut publik — siapa pun bisa download EBOOT-nya.
+#   Catatan: workflow_dispatch inputs BUKAN secret — nilai yang diisi tampil
+#   di log run dan di API, tidak di-mask (beda dengan secret yang di-mask).
+#   Makanya varian cloud ini tetap HANYA untuk FORK PRIVAT. Kalau input
+#   kosong, workflow gagal di awal dengan pesan yang jelas.
 #
 # PERBAIKAN DARI DRAF AWAL (yang bikin build gagal / lolos diam-diam):
 #   1. venv WAJIB dibuat. tools/lift_spu.sh tidak punya fallback ke system
@@ -52,11 +52,10 @@
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
 #      .github/workflows/build-avx-cloud.yml (GitHub App tidak punya
 #      permission Workflows).
-#   2. Di fork itu: Settings > Secrets and variables > Actions > set secret
-#      EBOOT_URL = link download langsung EBOOT_101.ELF (Dropbox ...?dl=1).
-#   3. Actions > Build dod3 (AVX) - Cloud Runner > Run workflow. Tidak ada
-#      input URL lagi — URL cuma ada di secret.
-#   4. Setelah selesai, download artifact dari halaman run-nya. Artifact
+#   2. Actions > Build dod3 (AVX) - Cloud Runner > Run workflow, isi kolom
+#      eboot_url dengan link download langsung EBOOT_101.ELF (Dropbox
+#      ...?dl=1). Kolomnya default kosong — link tidak tersimpan di file.
+#   3. Setelah selesai, download artifact dari halaman run-nya. Artifact
 #      kedaluwarsa (default 90 hari) — simpan zip-nya ke disk sendiri.
 
 name: Build dod3 (AVX) - Cloud Runner
@@ -64,6 +63,11 @@ name: Build dod3 (AVX) - Cloud Runner
 on:
   workflow_dispatch:
     inputs:
+      eboot_url:
+        description: "Direct download URL ke EBOOT_101.ELF (diisi tiap run, tidak tersimpan di file)"
+        required: true
+        type: string
+        default: ""
       x86_level:
         description: "DOD3_X86_LEVEL: x86-64-v2 = AVX (Sandy Bridge / i7-2600)"
         type: string
@@ -140,14 +144,14 @@ jobs:
       - name: Download & Validate EBOOT_101.ELF
         shell: pwsh
         run: |
-          $url = "${{ secrets.EBOOT_URL }}"
+          $url = "${{ inputs.eboot_url }}"
           if (-not $url) {
-            Write-Error "Secret EBOOT_URL belum di-set di fork ini (Settings > Secrets and variables > Actions). Isi dengan link download langsung EBOOT_101.ELF, lalu re-run."
+            Write-Error "Kolom eboot_url kosong. Isi dengan link download langsung EBOOT_101.ELF saat Run workflow, lalu re-run."
             exit 1
           }
           New-Item -ItemType Directory -Force -Path elf | Out-Null
 
-          Write-Host "Mengunduh file EBOOT dari URL di secret EBOOT_URL..."
+          Write-Host "Mengunduh file EBOOT dari URL di input eboot_url..."
           # Menggunakan User-Agent browser agar tidak diblokir/dibatasi Dropbox
           curl.exe -L -f -A "Mozilla/5.0" -o elf/EBOOT_101.ELF $url
 
@@ -170,7 +174,7 @@ jobs:
           $sha = (Get-FileHash elf/EBOOT_101.ELF -Algorithm SHA256).Hash.ToLower()
           Write-Host "SHA-256: $sha"
           if (-not $sha.StartsWith('ed89e80f2336a948')) {
-            Write-Error "SHA-256 tidak cocok dengan EBOOT 1.01 yang didokumentasikan (prefix ed89e80f2336a948...). File salah — cek link di secret EBOOT_URL."
+            Write-Error "SHA-256 tidak cocok dengan EBOOT 1.01 yang didokumentasikan (prefix ed89e80f2336a948...). File salah — cek link di kolom eboot_url."
             exit 1
           }
 
