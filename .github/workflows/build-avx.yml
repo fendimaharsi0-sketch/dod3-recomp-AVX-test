@@ -133,6 +133,21 @@
 #      apa pun yang ketemu; gagal keras kalau tidak ketemu di keduanya.
 #      Verify juga cek pola zlib*.dll, bukan nama zlib1.dll. Log run v8
 #      (baris "Staged zlib...") akan menunjukkan nama sebenarnya.
+#  12. v9 (staging v8: tidak ada zlib*.dll di mana pun — 2026-10-19):
+#      run v8 (392231005372, 42m40s): Build lolos (31m8s), staging gagal
+#      karena tidak ada zlib*.dll di build-avx/ MAUPUN di bin vcpkg.
+#      Artinya vcpkg meng-install zlib sebagai STATIC lib (tidak ada
+#      DLL-nya) — dan karena Build lolos, exe kemungkinan besar ter-link
+#      statis ke zlib (tidak butuh DLL zlib sama sekali). Menebak nama
+#      file sudah dua kali gagal (zlib1.dll, lalu zlib*.dll) — v9 berhenti
+#      menebak dan TANYA EXE-nya via dumpbin /DEPENDENTS (ground truth):
+#      kalau exe mengimpor DLL zlib, DLL itu wajib ada (cari nama
+#      persisnya di build-avx/ lalu bin vcpkg, gagal keras kalau tidak
+#      ketemu); kalau tidak diimpor, zlib statis — skip, bukan error.
+#      Staging juga warning untuk import DLL non-sistem lain yang tidak
+#      di-stage (cek System32). Verify pakai dumpbin yang sama. Catatan:
+#      kalau zlib statis, package_win.sh tetap gagal di cp zlib1.dll
+#      (continue-on-error) — artifact loose tetap lengkap dan bisa jalan.
 #
 # CARA PAKAI
 #   1. Fork privat soyjxck/dod3-recomp. Paste file ini manual di web UI ke
@@ -201,7 +216,7 @@ jobs:
       - name: Workflow version marker
         shell: pwsh
         run: |
-          Write-Host "WORKFLOW build-avx-cloud v8 (zlib DLL discovery zlib*.dll + stage runtime DLLs + dedicated vcpkg clone + Verify LASTEXITCODE fix)"
+          Write-Host "WORKFLOW build-avx-cloud v9 (dumpbin ground truth for zlib + stage runtime DLLs + dedicated vcpkg clone)"
 
       - name: MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -431,23 +446,40 @@ jobs:
           Copy-Item $sdl2 build-avx/ -Force
           Write-Host "Staged SDL2.dll"
 
-          # zlib: nama DLL TIDAK di-hardcode. vcpkg bisa menghasilkan
-          # zlib1.dll atau zlib.dll (run v7: zlib1.dll tidak ada di bin
-          # padahal SDL2.dll ada). Cari pola zlib*.dll di build-avx/
-          # (hasil applocal vcpkg saat Build) dulu, lalu di bin vcpkg.
-          # Copy apa pun yang ketemu — nama import di exe selalu cocok
-          # dengan nama file DLL dari install vcpkg yang sama.
-          $zlibDll = Get-ChildItem "build-avx\zlib*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($zlibDll) {
-            Write-Host ("zlib DLL sudah ada di build-avx/: " + $zlibDll.Name)
-          } else {
-            $zlibDll = Get-ChildItem "$bin\zlib*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $zlibDll) {
-              Write-Error "DLL zlib tidak ditemukan di build-avx/ maupun di $bin (dicari zlib*.dll). vcpkg install tidak menghasilkan DLL zlib."
-              exit 1
+          # zlib: TANYA EXE-nya via dumpbin /DEPENDENTS (ground truth),
+          # jangan tebak nama file (sudah dua kali gagal: zlib1.dll lalu
+          # zlib*.dll — ternyata tidak ada DLL zlib di mana pun karena
+          # vcpkg meng-install zlib sebagai STATIC lib). Kalau exe
+          # mengimpor DLL zlib, DLL itu WAJIB ada (cari nama persisnya di
+          # build-avx/ lalu bin vcpkg, gagal keras kalau tidak ketemu).
+          # Kalau tidak diimpor, zlib statis — skip, bukan error.
+          $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
+          if (-not $dumpbin) {
+            Write-Error "dumpbin tidak ditemukan di PATH (MSVC dev env?)."
+            exit 1
+          }
+          $deps = & dumpbin /DEPENDENTS build-avx/dod3.exe 2>$null | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '\.dll$' }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "dumpbin /DEPENDENTS gagal untuk build-avx/dod3.exe."
+            exit 1
+          }
+          Write-Host ("DLL yang diimpor exe: " + ($deps -join ', '))
+          $zlibImport = @($deps | Where-Object { $_ -match '^zlib.*\.dll$' })
+          if ($zlibImport) {
+            $zname = $zlibImport[0]
+            if (Test-Path "build-avx/$zname") {
+              Write-Host "zlib DLL $zname sudah ada di build-avx/."
+            } else {
+              $zsrc = Join-Path $bin $zname
+              if (-not (Test-Path $zsrc)) {
+                Write-Error "Exe mengimpor $zname tapi file-nya tidak ada di build-avx/ maupun di $zsrc. vcpkg install tidak menghasilkan DLL ini."
+                exit 1
+              }
+              Copy-Item $zsrc build-avx/ -Force
+              Write-Host "Staged $zname"
             }
-            Copy-Item $zlibDll.FullName build-avx/ -Force
-            Write-Host ("Staged " + $zlibDll.Name)
+          } else {
+            Write-Host "Exe tidak mengimpor DLL zlib (zlib ter-link statis) — tidak ada DLL zlib yang perlu di-stage."
           }
 
           $crtDirs = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName
@@ -465,6 +497,18 @@ jobs:
             }
           } else {
             Write-Warning "Folder Microsoft.VC*.CRT tidak ditemukan — CRT DLL tidak di-stage. PC tanpa VC Redist tidak bisa menjalankan exe."
+          }
+
+          # Import DLL lain yang bukan sistem dan tidak di-stage ->
+          # warning (exe mungkin error saat dijalankan). DLL sistem
+          # dikenali karena ada di C:\Windows\System32; API set
+          # (API-MS-WIN-*) dikecualikan berdasarkan nama.
+          $handled = @('SDL2.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') + @($zlibImport)
+          foreach ($d in $deps) {
+            if ($handled -contains $d) { continue }
+            if ($d -like 'API-MS-WIN-*') { continue }
+            if (Test-Path "C:\Windows\System32\$d") { continue }
+            Write-Warning "Exe mengimpor $d, DLL ini tidak ada di System32 dan tidak di-stage — exe mungkin error saat dijalankan."
           }
 
           if (Test-Path dod3.ini) {
@@ -511,10 +555,24 @@ jobs:
             Write-Error "Runtime DLL SDL2.dll tidak ada di build-avx/ — exe tidak bisa jalan tanpa DLL ini."
             exit 1
           }
-          # zlib: cek pola, bukan nama (bisa zlib1.dll atau zlib.dll).
-          if (-not (Get-ChildItem "build-avx\zlib*.dll" -ErrorAction SilentlyContinue)) {
-            Write-Error "DLL zlib (zlib*.dll) tidak ada di build-avx/ — exe tidak bisa jalan tanpa DLL ini."
-            exit 1
+          # zlib: hanya wajib kalau exe mengimpornya (dumpbin = ground
+          # truth). Kalau tidak diimpor, zlib statis — tidak ada DLL yang
+          # perlu dicek (itulah yang terjadi di run v8).
+          $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
+          if ($dumpbin) {
+            $deps = & dumpbin /DEPENDENTS build-avx/dod3.exe 2>$null | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '\.dll$' }
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "dumpbin /DEPENDENTS gagal untuk build-avx/dod3.exe."
+              exit 1
+            }
+            $zlibImport = @($deps | Where-Object { $_ -match '^zlib.*\.dll$' })
+            if ($zlibImport -and -not (Test-Path "build-avx/$($zlibImport[0])")) {
+              Write-Error "Exe mengimpor $($zlibImport[0]) tapi file-nya tidak ada di build-avx/."
+              exit 1
+            }
+            if (-not $zlibImport) { Write-Host "Exe tidak mengimpor DLL zlib (statis)." }
+          } else {
+            Write-Warning "dumpbin tidak ditemukan — cek import zlib dilewati."
           }
           foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
             if (-not (Test-Path "build-avx/$dll")) {
